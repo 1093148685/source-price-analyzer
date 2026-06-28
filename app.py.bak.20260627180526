@@ -1,0 +1,278 @@
+import os
+import re
+import json
+import time
+import html
+import statistics
+from typing import Any
+
+import requests
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from jinja2 import Template
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(APP_DIR, "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+CACHE_FILE = os.path.join(DATA_DIR, "cache.json")
+TOKEN_FILE = os.path.join(DATA_DIR, "token.json")
+
+BASE = "https://pay.ldxp.cn"
+USERNAME = os.getenv("LDXP_USERNAME", "hugojin")
+PASSWORD = os.getenv("LDXP_PASSWORD", "")
+ESA_COOKIE = os.getenv("LDXP_ACW_SC_V2", "6a4007d7730ae78566fffb44cbf834f097d9e889")
+CACHE_TTL = int(os.getenv("SOURCE_PRICE_CACHE_TTL", "900"))
+
+PRODUCT_GROUPS = [
+    {"slug": "chatgpt", "name": "ChatGPT / GPT", "keywords": ["ChatGPT", "GPT", "OpenAI"], "emoji": "🤖", "accent": "#10b981"},
+    {"slug": "claude", "name": "Claude", "keywords": ["Claude"], "emoji": "🧠", "accent": "#f97316"},
+    {"slug": "grok", "name": "Grok", "keywords": ["Grok"], "emoji": "𝕏", "accent": "#111827"},
+    {"slug": "netflix", "name": "Netflix / 奈飞", "keywords": ["Netflix", "奈飞"], "emoji": "🎬", "accent": "#ef4444"},
+    {"slug": "cloud-drive", "name": "网盘 / 云盘", "keywords": ["网盘", "夸克", "百度网盘", "云盘"], "emoji": "☁️", "accent": "#0ea5e9"},
+    {"slug": "apple", "name": "Apple ID / 苹果", "keywords": ["Apple ID", "苹果", "iCloud"], "emoji": "🍎", "accent": "#6b7280"},
+    {"slug": "baidu", "name": "百度", "keywords": ["百度", "百度网盘"], "emoji": "🔍", "accent": "#2563eb"},
+    {"slug": "membership", "name": "会员权益", "keywords": ["会员", "权益"], "emoji": "💎", "accent": "#8b5cf6"},
+]
+
+
+def _session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    })
+    if ESA_COOKIE:
+        s.cookies.set("acw_sc__v2", ESA_COOKIE, domain="pay.ldxp.cn")
+    return s
+
+
+def _load_token() -> str | None:
+    try:
+        data = json.load(open(TOKEN_FILE, encoding="utf-8"))
+        if data.get("expires", 0) > time.time() and data.get("token"):
+            return data["token"]
+    except Exception:
+        pass
+    return None
+
+
+def _save_token(token: str):
+    with open(TOKEN_FILE, "w", encoding="utf-8") as f:
+        json.dump({"token": token, "expires": time.time() + 3600 * 6}, f)
+
+
+def _login() -> str:
+    token = _load_token()
+    if token:
+        return token
+    if not PASSWORD:
+        raise RuntimeError("缺少 LDXP_PASSWORD 环境变量，无法刷新链动小铺 token")
+    s = _session()
+    r = s.post(
+        BASE + "/merchantApi/user/login",
+        json={"username": USERNAME, "password": PASSWORD},
+        headers={"Accept": "application/json, text/plain, */*", "Content-Type": "application/json", "Referer": BASE + "/merchant/login"},
+        timeout=30,
+    )
+    data = r.json()
+    if data.get("code") != 1:
+        raise RuntimeError(f"链动登录失败: {data.get('msg')}")
+    token = data["data"]["merchant_token"]
+    _save_token(token)
+    return token
+
+
+def _api_post(path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    token = _login()
+    s = _session()
+    s.cookies.set("merchant-token", token, domain="pay.ldxp.cn")
+    h = {
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+        "Referer": BASE + "/merchant/my_parent/source_square",
+        "merchant-token": token,
+    }
+    r = s.post(BASE + path, json=payload, headers=h, timeout=40)
+    data = r.json()
+    if data.get("code") == 401 or data.get("msg") in ("登录已过期", "请先登录"):
+        try:
+            os.remove(TOKEN_FILE)
+        except FileNotFoundError:
+            pass
+        return _api_post(path, payload)
+    return data
+
+
+def _price(item: dict[str, Any]) -> float:
+    for k in ["agent_price_limit", "agent_price3", "agent_price2", "agent_price1", "cost_price", "price"]:
+        v = item.get(k)
+        try:
+            if v is not None and float(v) > 0:
+                return round(float(v), 2)
+        except Exception:
+            pass
+    return 0.0
+
+
+def _strip(text: str) -> str:
+    text = re.sub(r"<script[\s\S]*?</script>|<style[\s\S]*?</style>", " ", text or "")
+    text = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", html.unescape(text)).strip()
+
+
+def _dedupe(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen, out = set(), []
+    for it in items:
+        gid = it.get("id") or it.get("goods_key") or it.get("link")
+        if gid in seen:
+            continue
+        seen.add(gid)
+        out.append(it)
+    return out
+
+
+def fetch_group(group: dict[str, Any], page_size: int = 40) -> dict[str, Any]:
+    raw_items = []
+    for kw in group["keywords"]:
+        data = _api_post("/merchantApi/MyParent/searchGoodsList", {
+            "current": 1,
+            "pageSize": page_size,
+            "goods_type": "card",
+            "keywords": kw,
+            "name": "",
+        })
+        raw_items.extend(((data.get("data") or {}).get("list") or []))
+    items = []
+    for it in _dedupe(raw_items):
+        user = it.get("user") or {}
+        category = it.get("category") or {}
+        p = _price(it)
+        if p <= 0:
+            continue
+        items.append({
+            "id": it.get("id"),
+            "name": it.get("name") or "未命名商品",
+            "price": p,
+            "stock": int(it.get("stock_count") or 0),
+            "status": it.get("status"),
+            "verify": it.get("verify"),
+            "link": it.get("link"),
+            "category": category.get("name") or "未分类",
+            "shop": user.get("nickname") or "未知商家",
+            "shop_link": user.get("link"),
+            "avatar": user.get("avatar"),
+            "contact": user.get("contact_qq") or user.get("contact_wechat") or user.get("contact_mobile") or "",
+            "summary": _strip(it.get("description") or "")[:180],
+        })
+    items.sort(key=lambda x: (x["price"], -x["stock"]))
+    prices = [x["price"] for x in items]
+    shops = len({x["shop"] for x in items})
+    cats = len({x["category"] for x in items})
+    return {
+        **group,
+        "count": len(items),
+        "shops": shops,
+        "categories": cats,
+        "stock": sum(x["stock"] for x in items),
+        "min_price": min(prices) if prices else 0,
+        "max_price": max(prices) if prices else 0,
+        "avg_price": round(statistics.mean(prices), 2) if prices else 0,
+        "median_price": round(statistics.median(prices), 2) if prices else 0,
+        "best": items[:3],
+        "items": items,
+    }
+
+
+def build_snapshot(force: bool = False) -> dict[str, Any]:
+    if not force:
+        try:
+            cache = json.load(open(CACHE_FILE, encoding="utf-8"))
+            if cache.get("expires", 0) > time.time():
+                return cache
+        except Exception:
+            pass
+    groups = [fetch_group(g) for g in PRODUCT_GROUPS]
+    all_items = [it for g in groups for it in g["items"]]
+    snapshot = {
+        "generated_at": int(time.time()),
+        "expires": time.time() + CACHE_TTL,
+        "groups": groups,
+        "stats": {
+            "product_groups": len(groups),
+            "products": len(all_items),
+            "shops": len({x["shop"] for x in all_items}),
+            "lowest": min([x["price"] for x in all_items], default=0),
+        },
+    }
+    with open(CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(snapshot, f, ensure_ascii=False, indent=2)
+    return snapshot
+
+
+app = FastAPI(title="链动货源价格")
+
+HTML = r'''
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>链动货源价格 - 发现货源广场最低价</title>
+<style>
+:root{--blue:#0a84ff;--green:#34c759;--text:#111827;--muted:#6b7280;--line:#e5e7eb;--bg:#f8fafc}
+*{box-sizing:border-box}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",Arial,sans-serif;background:linear-gradient(180deg,#fff 0,#f8fbff 45%,#fff 100%);color:var(--text)}
+a{color:inherit;text-decoration:none}.nav{position:sticky;top:0;z-index:10;background:rgba(255,255,255,.82);backdrop-filter:blur(18px);border-bottom:1px solid rgba(229,231,235,.75)}.nav-inner{max-width:1180px;margin:0 auto;display:flex;align-items:center;justify-content:space-between;padding:18px 22px}.brand{display:flex;align-items:center;gap:10px;font-weight:800}.logo{width:34px;height:34px;border-radius:12px;background:linear-gradient(135deg,var(--blue),var(--green));box-shadow:0 12px 28px rgba(10,132,255,.2)}.nav-links{display:flex;gap:24px;color:#374151;font-size:14px}.search{display:flex;align-items:center;gap:8px;background:#fff;border:1px solid var(--line);border-radius:999px;padding:8px 12px;box-shadow:0 6px 18px rgba(15,23,42,.06)}.search input{border:0;outline:0;width:150px;font-size:14px}.hero{position:relative;overflow:hidden;text-align:center;padding:74px 18px 54px}.blob{position:absolute;border-radius:999px;filter:blur(48px);opacity:.18}.b1{width:320px;height:320px;background:var(--blue);left:5%;top:20px}.b2{width:280px;height:280px;background:var(--green);right:8%;top:80px}.badges{display:flex;justify-content:center;gap:12px;flex-wrap:wrap;margin-bottom:26px}.pill{display:inline-flex;align-items:center;gap:7px;background:#fff;border:1px solid var(--line);border-radius:999px;padding:8px 14px;box-shadow:0 8px 26px rgba(15,23,42,.06);font-size:13px;color:#374151}.new{font-size:10px;background:#ef4444;color:#fff;border-radius:999px;padding:2px 5px;font-weight:900}.hero h1{margin:0;font-size:clamp(46px,8vw,86px);line-height:1.02;letter-spacing:-.055em}.hero .dark{display:block;background:linear-gradient(90deg,#111827,#6b7280);-webkit-background-clip:text;color:transparent}.hero .grad{display:block;background:linear-gradient(90deg,var(--blue),var(--green),var(--blue));background-size:200% 100%;-webkit-background-clip:text;color:transparent;animation:slide 4s linear infinite}@keyframes slide{to{background-position:200% 0}}.hero p{font-size:20px;color:#5b6472;margin:18px auto 0;max-width:780px}.cta{margin-top:34px;display:flex;justify-content:center;gap:14px;flex-wrap:wrap}.btn{display:inline-flex;align-items:center;justify-content:center;border-radius:999px;padding:15px 30px;border:1px solid var(--line);background:#fff;font-weight:700;box-shadow:0 10px 24px rgba(15,23,42,.08);transition:.2s}.btn:hover{transform:translateY(-2px);box-shadow:0 14px 30px rgba(15,23,42,.12)}.btn.primary{background:#111827;color:#fff;border-color:#111827}.price-cards{max-width:980px;margin:58px auto 0;display:grid;grid-template-columns:repeat(3,1fr);gap:24px}.price-card{background:rgba(255,255,255,.92);border:1px solid rgba(255,255,255,.7);border-radius:28px;padding:24px;box-shadow:0 22px 55px rgba(15,23,42,.11);text-align:left}.price-card.best{transform:translateY(-14px);border-color:rgba(52,199,89,.38)}.pc-head{display:flex;gap:14px;align-items:center}.emoji{width:50px;height:50px;border-radius:18px;background:#f3f4f6;display:grid;place-items:center;font-size:24px}.pc-title{font-size:13px;color:var(--muted);font-weight:800}.pc-price{font-size:24px;font-weight:900;margin-top:3px}.bar{height:9px;background:#f3f4f6;border-radius:999px;overflow:hidden;margin-top:18px}.bar span{display:block;height:100%;background:linear-gradient(90deg,var(--blue),var(--green))}.section{max-width:1180px;margin:20px auto 0;padding:40px 22px}.section-head{display:flex;justify-content:space-between;align-items:end;gap:18px;margin-bottom:22px}.section h2{font-size:34px;margin:0;letter-spacing:-.03em}.section .sub{color:var(--muted);margin-top:8px}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:18px}.app-card{background:#fff;border:1px solid var(--line);border-radius:28px;padding:20px;box-shadow:0 12px 30px rgba(15,23,42,.06);transition:.2s;cursor:pointer}.app-card:hover{transform:translateY(-3px);box-shadow:0 18px 38px rgba(15,23,42,.1)}.app-top{display:flex;justify-content:space-between;gap:12px}.app-name{font-size:18px;font-weight:900}.metrics{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-top:18px}.metric{background:#f8fafc;border-radius:16px;padding:10px}.metric b{display:block;font-size:18px}.metric span{font-size:12px;color:var(--muted)}.tag{display:inline-flex;padding:5px 9px;border-radius:999px;background:#eef6ff;color:#0a64cc;font-size:12px;font-weight:800}.detail{max-width:1180px;margin:0 auto;padding:0 22px 60px}.detail-card{display:none;background:#fff;border:1px solid var(--line);border-radius:30px;box-shadow:0 18px 50px rgba(15,23,42,.08);overflow:hidden}.detail-card.active{display:block}.detail-head{padding:24px 26px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:20px}.table{width:100%;border-collapse:collapse}.table th,.table td{padding:14px 18px;border-bottom:1px solid #f1f5f9;text-align:left;vertical-align:top}.table th{font-size:12px;color:var(--muted);background:#fbfdff}.goods{font-weight:800;max-width:420px}.shop{color:#374151}.price{font-weight:900;color:#059669}.status{font-size:12px;padding:4px 8px;border-radius:999px;background:#ecfdf5;color:#047857}.footer{border-top:1px solid var(--line);background:#fff;margin-top:30px}.footer-inner{max-width:1180px;margin:0 auto;padding:38px 22px;display:grid;grid-template-columns:repeat(4,1fr);gap:20px;color:#6b7280}.footer h3{font-size:14px;color:#111827;margin:0 0 12px}.muted{color:var(--muted)}
+@media(max-width:900px){.nav-links{display:none}.price-cards,.grid{grid-template-columns:1fr}.price-card.best{transform:none}.footer-inner{grid-template-columns:1fr 1fr}.table{font-size:13px}.hero{padding-top:46px}}
+</style>
+</head>
+<body>
+<nav class="nav"><div class="nav-inner"><a class="brand" href="/"><span class="logo"></span><span>链动货源价格</span></a><div class="nav-links"><a href="/">首页</a><a href="#products">产品分类</a><a href="#compare">比价</a><a href="/api/data" target="_blank">API</a></div><form class="search" method="get"><span>⌕</span><input name="q" value="{{ q }}" placeholder="搜索产品" /></form></div></nav>
+<main>
+<section class="hero"><div class="blob b1"></div><div class="blob b2"></div><div class="badges"><span class="pill">加入监控</span><span class="pill">关注低价</span><span class="pill">货源广场 <span class="new">LIVE</span></span></div><h1><span class="dark">链动小铺</span><span class="grad">货源最低价</span></h1><p>实时抓取并归纳货源广场的商品价格，按 ChatGPT、Claude、百度、网盘等产品分类，帮你找到同类产品下更合适的商家与价格。</p><div class="cta"><a href="#products" class="btn primary">查看所有产品</a><a href="/refresh" class="btn">刷新货源数据 <span class="new" style="margin-left:8px">NEW</span></a></div>
+<div class="price-cards">
+{% for g in hero_groups %}<a class="price-card {{ 'best' if loop.index == 2 else '' }}" href="/?group={{g.slug}}#compare"><div class="pc-head"><div class="emoji">{{g.emoji}}</div><div><div class="pc-title">{{g.name}}</div><div class="pc-price">¥{{'%.2f'|format(g.min_price)}}</div></div></div><div class="bar"><span style="width:{{ 100 if loop.index==2 else 70 }}%"></span></div><p class="muted">{{g.count}} 个商品 · {{g.shops}} 个商家 · 库存 {{g.stock}}</p></a>{% endfor %}
+</div></section>
+<section class="section" id="products"><div class="section-head"><div><h2>产品分类</h2><div class="sub">按产品名自动归类，点击进入后展示不同商家的相关商品比价。</div></div><div class="tag">{{stats.products}} 商品 / {{stats.shops}} 商家</div></div><div class="grid">
+{% for g in groups %}{% if not q or q.lower() in g.name.lower() %}<a class="app-card" href="/?group={{g.slug}}#compare"><div class="app-top"><div><div class="emoji" style="background:{{g.accent}}18">{{g.emoji}}</div><div class="app-name" style="margin-top:12px">{{g.name}}</div><div class="muted" style="margin-top:6px">{{g.keywords|join(' / ')}}</div></div><span class="tag">最低 ¥{{'%.2f'|format(g.min_price)}}</span></div><div class="metrics"><div class="metric"><b>{{g.count}}</b><span>商品</span></div><div class="metric"><b>{{g.shops}}</b><span>商家</span></div><div class="metric"><b>{{g.stock}}</b><span>库存</span></div><div class="metric"><b>¥{{'%.0f'|format(g.avg_price)}}</b><span>均价</span></div></div></a>{% endif %}{% endfor %}
+</div></section>
+<section class="detail" id="compare">
+{% for g in groups %}<div class="detail-card {{ 'active' if g.slug == selected else '' }}" id="g-{{g.slug}}"><div class="detail-head"><div><h2 style="margin:0">{{g.emoji}} {{g.name}} 比价</h2><div class="muted">最低 ¥{{'%.2f'|format(g.min_price)}} / 中位 ¥{{'%.2f'|format(g.median_price)}} / 最高 ¥{{'%.2f'|format(g.max_price)}}</div></div><a class="btn" href="#products">返回分类</a></div><table class="table"><thead><tr><th>商品</th><th>价格</th><th>库存</th><th>商家</th><th>分类</th><th>状态</th></tr></thead><tbody>{% for it in g['items'][:60] %}<tr><td><a class="goods" href="{{it.link}}" target="_blank">{{it.name}}</a><div class="muted">{{it.summary}}</div></td><td class="price">¥{{'%.2f'|format(it.price)}}</td><td>{{it.stock}}</td><td class="shop"><a href="{{it.shop_link}}" target="_blank">{{it.shop}}</a><div class="muted">{{it.contact}}</div></td><td>{{it.category}}</td><td><span class="status">{{ '上架' if it.status == 1 else '下架/无货' }}</span></td></tr>{% endfor %}</tbody></table></div>{% endfor %}
+</section></main>
+<footer class="footer"><div class="footer-inner"><div><h3>法律</h3><div>仅用于货源价格分析</div><div>数据来自链动小铺商家后台</div></div><div><h3>工具</h3><div>产品分类</div><div>货源比价</div></div><div><h3>数据</h3><div>缓存时间 {{ generated }}</div><div>刷新间隔 {{ ttl }} 秒</div></div><div><h3>关于</h3><div>链动货源价格</div><div>App Store Price 风格复刻版</div></div></div></footer>
+<script>if(!location.hash&&location.search.includes('group=')){location.hash='compare'}</script>
+</body></html>
+'''
+
+
+@app.get("/", response_class=HTMLResponse)
+def index(request: Request):
+    data = build_snapshot(False)
+    selected = request.query_params.get("group") or (data["groups"][0]["slug"] if data["groups"] else "")
+    q = (request.query_params.get("q") or "").strip()
+    hero = sorted(data["groups"], key=lambda g: (g["min_price"] or 999999))[:3]
+    return Template(HTML).render(groups=data["groups"], hero_groups=hero, stats=data["stats"], selected=selected, q=q, generated=time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(data["generated_at"])), ttl=CACHE_TTL)
+
+
+@app.get("/refresh")
+def refresh():
+    build_snapshot(True)
+    return RedirectResponse(url="/", status_code=302)
+
+
+@app.get("/api/data")
+def api_data():
+    return JSONResponse(build_snapshot(False))
+
+
+@app.get("/api/group/{slug}")
+def api_group(slug: str):
+    data = build_snapshot(False)
+    for g in data["groups"]:
+        if g["slug"] == slug:
+            return JSONResponse(g)
+    return JSONResponse({"error": "not found"}, status_code=404)
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host=os.getenv("HOST", "0.0.0.0"), port=int(os.getenv("PORT", "8123")))

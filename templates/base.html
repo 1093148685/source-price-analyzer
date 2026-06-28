@@ -1,0 +1,30 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=5,viewport-fit=cover"><meta name="theme-color" content="#f8fafc"><title>{% block title %}Source Price - 发现全球货源最低价{% endblock %}</title><link rel="stylesheet" href="/static/style.css"></head><body><div class="bg-gradient"></div>
+
+<nav class="navbar">
+  <div class="nav-inner">
+    <div class="nav-glass">
+      <div class="nav-links">
+        <a class="nav-item{% if active_nav == 'home' %} active{% endif %}" href="/">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 21v-8a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v8"/><path d="M3 10a2 2 0 0 1 .709-1.528l7-5.999a2 2 0 0 1 2.582 0l7 5.999A2 2 0 0 1 21 10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+          <span>首页</span>
+        </a>
+        <a class="nav-item{% if active_nav == 'products' %} active{% endif %}" href="/products">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="7" height="7" x="3" y="3" rx="1"/><rect width="7" height="7" x="14" y="3" rx="1"/><rect width="7" height="7" x="3" y="14" rx="1"/><rect width="7" height="7" x="14" y="14" rx="1"/></svg>
+          <span>订阅</span>
+        </a>
+      </div>
+    </div>
+    <div class="nav-right">
+      <a class="nav-social" href="https://twitter.com" target="_blank" aria-label="Twitter">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+      </a>
+      <a class="nav-social" href="/sync-tg" aria-label="Telegram">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373 12-12S18.627 0 12 0zm5.562 8.161c-.18 1.897-.962 6.502-1.359 8.627-.168.9-.5 1.201-.82 1.23-.697.064-1.226-.46-1.901-.903-1.056-.693-1.653-1.124-2.678-1.8-1.185-.78-.417-1.21.258-1.91.177-.184 3.247-2.977 3.307-3.23.007-.032.014-.15-.056-.212s-.174-.041-.249-.024c-.106.024-1.793 1.14-5.061 3.345-.48.33-.913.49-1.302.48-.428-.008-1.252-.24-1.865-.44-.752-.244-1.349-.374-1.297-.789.027-.216.325-.437 1.126-.663 4.146-1.81 6.917-3.003 8.305-3.58 3.95-1.646 4.77-1.933 5.305-1.942.118-.003.28.018.404.11.1.074.13.172.143.243.013.071.03.224.017.34z"/></svg>
+      </a>
+    </div>
+  </div>
+</nav>
+
+{% block body %}{% endblock %}
+<script src="/static/app.js"></script>
+</body></html>

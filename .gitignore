@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+.venv/
+venv/
+
+# Build output
+dist/
+build/
+
+# Environment
+.env
+.env.*
+!frontend/.env.example
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Runtime
+*.pyc
+__pycache__/
+*.sqlite3
+*.session
+
+# Data (cache, tokens, health reports)
+data/
+!data/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Archives
+*.tar.gz
+*.zip
