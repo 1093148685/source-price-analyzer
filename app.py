@@ -1,6 +1,6 @@
-import os,re,json,time,html,statistics,requests,subprocess
+import os,re,json,time,html,statistics,requests,subprocess,asyncio,uuid
 from typing import Any
-from fastapi import FastAPI,Request,Form
+from fastapi import FastAPI,Request,Form,WebSocket,WebSocketDisconnect
 from fastapi.responses import HTMLResponse,JSONResponse,RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from jinja2 import Environment,FileSystemLoader,select_autoescape
@@ -352,6 +352,39 @@ from pipeline.runner import run_pipeline as _run_pipeline
 PIPELINE_CACHE_FILE = os.path.join(DATA_DIR, 'cache_pipeline.json')
 DIRECT_SHOPS_FILE = os.path.join(DATA_DIR, 'direct_shops.json')
 
+# Merged snapshot cache: base pipeline/cache + direct_shops.json after merge.
+# This avoids recomputing merge_direct_into_snapshot() and stats on every page/API request.
+_MERGED_SNAPSHOT_CACHE = {'key': None, 'data': None, 'ts': 0.0}
+
+def _file_sig(path: str):
+    try:
+        st = os.stat(path)
+        return (path, int(st.st_mtime), st.st_size)
+    except FileNotFoundError:
+        return (path, 0, 0)
+
+def _snapshot_cache_key():
+    return (_file_sig(PIPELINE_CACHE_FILE), _file_sig(CACHE_FILE), _file_sig(DIRECT_SHOPS_FILE))
+
+def invalidate_snapshot_cache():
+    _MERGED_SNAPSHOT_CACHE['key'] = None
+    _MERGED_SNAPSHOT_CACHE['data'] = None
+    _MERGED_SNAPSHOT_CACHE['ts'] = 0.0
+
+def get_merged_snapshot_cache():
+    key = _snapshot_cache_key()
+    if (_MERGED_SNAPSHOT_CACHE.get('key') == key and
+        _MERGED_SNAPSHOT_CACHE.get('data') is not None and
+        time.time() - float(_MERGED_SNAPSHOT_CACHE.get('ts') or 0) < CACHE_TTL):
+        return _MERGED_SNAPSHOT_CACHE['data']
+    return None
+
+def set_merged_snapshot_cache(data: dict):
+    _MERGED_SNAPSHOT_CACHE['key'] = _snapshot_cache_key()
+    _MERGED_SNAPSHOT_CACHE['data'] = data
+    _MERGED_SNAPSHOT_CACHE['ts'] = time.time()
+    return data
+
 def load_direct_shop_items() -> dict:
     """加载通过店铺直抓收录的商品 {shop_slug: {shop_info, items: [...], ts}}"""
     try:
@@ -364,6 +397,7 @@ def load_direct_shop_items() -> dict:
 def save_direct_shop_items(data: dict):
     """保存直抓收录数据"""
     json.dump(data, open(DIRECT_SHOPS_FILE, 'w'), ensure_ascii=False, indent=2)
+    invalidate_snapshot_cache()
 
 def merge_direct_into_snapshot(snapshot: dict) -> dict:
     """将直抓收录的商品合并到 snapshot 中（all_items + types/products 分类结构）"""
@@ -550,15 +584,22 @@ def save_snapshot_caches(data: dict):
         json.dump(data, open(CACHE_FILE, 'w'), ensure_ascii=False, indent=2)
     except Exception:
         pass
+    invalidate_snapshot_cache()
     return True
 
 def build_snapshot(force=False):
     """使用 Pipeline 引擎: 采集→标准化→分类→分组；空抓取结果绝不覆盖旧缓存。"""
+    if force:
+        invalidate_snapshot_cache()
+    else:
+        cached = get_merged_snapshot_cache()
+        if cached is not None:
+            return cached
     if (not force) and os.path.exists(PIPELINE_CACHE_FILE):
         try:
             d = json.load(open(PIPELINE_CACHE_FILE))
             if time.time() - d.get('ts', 0) < CACHE_TTL and snapshot_item_count(d) > 0:
-                return merge_direct_into_snapshot(d)
+                return set_merged_snapshot_cache(merge_direct_into_snapshot(d))
         except Exception:
             pass
 
@@ -584,7 +625,7 @@ def build_snapshot(force=False):
 
     if data is None:
         data = {'ts': time.time(), 'types': [], 'products': [], 'all_items': [], 'ai_config': {'mode': 'empty', 'note': '无可用货源缓存'}}
-    return merge_direct_into_snapshot(data)
+    return set_merged_snapshot_cache(merge_direct_into_snapshot(data))
 
 def load_legacy_cache():
  path=os.path.join(DATA_DIR,'cache.json')
@@ -939,60 +980,71 @@ def api_dns_record_delete(domain: str = Form(...), domain_id: str = Form(''), na
         return JSONResponse({'ok': False, 'error': str(e)}, status_code=500)
 
 # ── Shop Analyzer ──
-@app.post('/api/analyze-shop')
-async def api_analyze_shop(request: Request):
-    """解析店铺：输入 shop URL(s)，自动拉取商品并分类"""
+ANALYZE_JOBS = {}
+ANALYZE_JOB_TTL = 1800
+
+def extract_shop_slugs(urls):
     import re as _re
-    body = {}
-    try:
-        body = await request.json()
-    except:
-        pass
-    
-    urls = body.get('urls', []) or body.get('url', [])
     if isinstance(urls, str):
         urls = [urls]
-    if not urls:
-        return JSONResponse({'ok': False, 'error': '请提供店铺URL'}, status_code=400)
-    
-    # Extract shop slugs
     slugs = []
-    for u in urls:
+    for u in urls or []:
         m = _re.search(r'/shop/([^/\s?#]+)', str(u))
         if m:
-            slugs.append(m.group(1))
-    if not slugs:
-        return JSONResponse({'ok': False, 'error': '未识别到店铺slug'}, status_code=400)
-    
-    # Load all goods (use cache or fresh)
+            slug = m.group(1)
+            if slug not in slugs:
+                slugs.append(slug)
+    return slugs
+
+def _job_emit(job_id: str, event: str, **payload):
+    job = ANALYZE_JOBS.get(job_id)
+    if not job:
+        return
+    msg = {'event': event, 'ts': time.time(), **payload}
+    job.setdefault('events', []).append(msg)
+    job['updated_at'] = time.time()
+    if len(job['events']) > 300:
+        job['events'] = job['events'][-300:]
+
+async def analyze_shop_slugs(slugs, job_id: str | None = None):
+    """解析店铺。WebSocket/job 模式只推送本站进度，不增加上游请求频率。"""
+    def emit(event, **payload):
+        if job_id:
+            _job_emit(job_id, event, **payload)
+
+    emit('started', total=len(slugs), message=f'开始解析 {len(slugs)} 个店铺')
     data = build_snapshot(False)
     all_items = data.get('all_items', [])
-    
-    # Filter and classify
-    from pipeline.classifier.product_detector import classify_product, detect_product
+
+    from pipeline.classifier.product_detector import classify_product
     from pipeline.classifier.subtype_classifier import classify_subtype
-    
+    from pipeline.schema import NormItem
+
     results = {}
     _direct_slugs = []
-    _direct_full_items = {}  # slug -> full shop_items list for saving
-    for slug in slugs:
+    _direct_full_items = {}
+    loop = asyncio.get_event_loop()
+
+    for idx, slug in enumerate(slugs, start=1):
+        emit('shop_started', slug=slug, index=idx, total=len(slugs), message=f'检查店铺 {slug}')
         _shop_info = None
         _from_direct = False
         shop_items = [it for it in all_items if str(it.get('shop_id','')) == slug]
+        source = 'cache'
+
         if not shop_items:
-            # Fallback: 直接抓取店铺页面（未开启货源名片的店铺）
+            emit('direct_fetch', slug=slug, message='货品池未命中，开始服务端直抓店铺（串行限速，避免高频触发风控）')
             try:
                 from pipeline.connectors.ldxp import fetch_shop_direct
-                import asyncio
-                loop = asyncio.get_event_loop()
                 shop_info, norm_items, err = await loop.run_in_executor(None, fetch_shop_direct, slug)
                 if err:
                     results[slug] = {'found': False, 'items': [], 'categories': {}, 'hint': f'直接抓取失败: {err}'}
+                    emit('shop_done', slug=slug, found=False, error=str(err), message=f'{slug} 直抓失败')
                     continue
                 if not norm_items:
                     results[slug] = {'found': False, 'items': [], 'categories': {}, 'hint': '店铺不存在或无商品'}
+                    emit('shop_done', slug=slug, found=False, message=f'{slug} 无商品')
                     continue
-                # Convert NormItem list to dict format
                 shop_items = []
                 for ni in norm_items:
                     shop_items.append({
@@ -1008,22 +1060,24 @@ async def api_analyze_shop(request: Request):
                         'trusted': True,
                         'raw': {},
                     })
-                # Store shop info for response
                 _shop_info = shop_info
                 _from_direct = True
-                _direct_full_items[slug] = list(shop_items)  # save copy for persistence
+                source = 'direct'
+                _direct_full_items[slug] = list(shop_items)
+                emit('direct_done', slug=slug, count=len(shop_items), message=f'直抓完成：{len(shop_items)} 件')
             except Exception as e:
                 results[slug] = {'found': False, 'items': [], 'categories': {}, 'hint': f'直接抓取异常: {str(e)}'}
+                emit('shop_done', slug=slug, found=False, error=type(e).__name__, message=f'{slug} 直抓异常')
                 continue
+
         if not shop_items:
             results[slug] = {'found': False, 'items': [], 'categories': {}, 'hint': '该店铺商品未出现在货品池中，尝试直接抓取也失败'}
+            emit('shop_done', slug=slug, found=False, message=f'{slug} 未找到商品')
             continue
-        
-        # Classify each item
+
+        emit('classifying', slug=slug, count=len(shop_items), message=f'开始分类 {len(shop_items)} 件商品')
         categorized = {}
         for it in shop_items:
-            # Build a minimal NormItem
-            from pipeline.schema import NormItem
             ni = NormItem(
                 source='ldxp', source_id=str(it.get('id','')),
                 title=it.get('title',''), description=it.get('desc',''),
@@ -1033,7 +1087,6 @@ async def api_analyze_shop(request: Request):
             )
             type_slug, type_name, conf = classify_product(ni)
             sub_slug, sub_name, method = classify_subtype(ni, type_slug)
-            
             key = f"{type_slug}|{sub_slug}"
             if key not in categorized:
                 categorized[key] = {
@@ -1046,10 +1099,11 @@ async def api_analyze_shop(request: Request):
                 'price': it.get('price'), 'stock': it.get('stock',0),
                 'link': it.get('link',''), 'trusted': it.get('trusted', True),
             })
-        
+
         result_entry = {
             'found': True,
             'total': len(shop_items),
+            'source': source,
             'categories': sorted(categorized.values(), key=lambda x: -len(x['items'])),
         }
         if _shop_info:
@@ -1058,10 +1112,11 @@ async def api_analyze_shop(request: Request):
             result_entry['indexed'] = True
             _direct_slugs.append(slug)
         results[slug] = result_entry
-    
-    # 自动收录：将直抓商品保存到持久化存储
+        emit('shop_done', slug=slug, found=True, source=source, count=len(shop_items), categories=len(result_entry['categories']), message=f'{slug} 完成：{len(shop_items)} 件，{len(result_entry["categories"])} 个分类')
+
     indexed_count = 0
     if _direct_slugs:
+        emit('indexing', count=len(_direct_slugs), message='保存直抓结果并刷新站内分类索引')
         direct = load_direct_shop_items()
         for slug in _direct_slugs:
             r = results[slug]
@@ -1073,12 +1128,105 @@ async def api_analyze_shop(request: Request):
             }
             indexed_count += len(full_items)
         save_direct_shop_items(direct)
-    
+        build_snapshot(False)
+
     resp = {'ok': True, 'results': results, 'slugs': slugs}
     if indexed_count > 0:
         resp['indexed'] = indexed_count
         resp['message'] = f'已收录 {indexed_count} 件商品到站点分类中'
-    return JSONResponse(resp)
+    emit('finished', ok=True, indexed=indexed_count, message='解析完成')
+    return resp
+
+async def _run_analyze_job(job_id: str, slugs):
+    job = ANALYZE_JOBS[job_id]
+    job['status'] = 'running'
+    job['started_at'] = time.time()
+    try:
+        job['result'] = await analyze_shop_slugs(slugs, job_id=job_id)
+        job['status'] = 'done'
+    except Exception as e:
+        job['status'] = 'error'
+        job['error'] = str(e)
+        _job_emit(job_id, 'error', message=str(e), error=type(e).__name__)
+    finally:
+        job['updated_at'] = time.time()
+
+def _cleanup_jobs():
+    now = time.time()
+    for jid in list(ANALYZE_JOBS.keys()):
+        if now - ANALYZE_JOBS[jid].get('created_at', now) > ANALYZE_JOB_TTL:
+            ANALYZE_JOBS.pop(jid, None)
+
+@app.post('/api/analyze-shop')
+async def api_analyze_shop(request: Request):
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    urls = body.get('urls', []) or body.get('url', [])
+    slugs = extract_shop_slugs(urls)
+    if not urls:
+        return JSONResponse({'ok': False, 'error': '请提供店铺URL'}, status_code=400)
+    if not slugs:
+        return JSONResponse({'ok': False, 'error': '未识别到店铺slug'}, status_code=400)
+    return JSONResponse(await analyze_shop_slugs(slugs))
+
+@app.post('/api/analyze-shop/jobs')
+async def api_analyze_shop_job(request: Request):
+    _cleanup_jobs()
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    urls = body.get('urls', []) or body.get('url', [])
+    slugs = extract_shop_slugs(urls)
+    if not urls:
+        return JSONResponse({'ok': False, 'error': '请提供店铺URL'}, status_code=400)
+    if not slugs:
+        return JSONResponse({'ok': False, 'error': '未识别到店铺slug'}, status_code=400)
+    job_id = uuid.uuid4().hex
+    ANALYZE_JOBS[job_id] = {
+        'job_id': job_id, 'status': 'queued', 'slugs': slugs,
+        'events': [], 'result': None,
+        'created_at': time.time(), 'updated_at': time.time(),
+    }
+    asyncio.create_task(_run_analyze_job(job_id, slugs))
+    return JSONResponse({'ok': True, 'job_id': job_id, 'slugs': slugs, 'ws': f'/ws/analyze/{job_id}'})
+
+@app.get('/api/analyze-shop/jobs/{job_id}')
+def api_analyze_shop_job_status(job_id: str):
+    job = ANALYZE_JOBS.get(job_id)
+    if not job:
+        return JSONResponse({'ok': False, 'error': 'job not found'}, status_code=404)
+    data = {k: v for k, v in job.items() if k != 'events'}
+    data['ok'] = True
+    data['events'] = job.get('events', [])[-100:]
+    return JSONResponse(data)
+
+@app.websocket('/ws/analyze/{job_id}')
+async def ws_analyze_shop(websocket: WebSocket, job_id: str):
+    await websocket.accept()
+    last = 0
+    try:
+        while True:
+            job = ANALYZE_JOBS.get(job_id)
+            if not job:
+                await websocket.send_json({'event': 'error', 'message': 'job not found'})
+                await websocket.close()
+                return
+            events = job.get('events', [])
+            for ev in events[last:]:
+                await websocket.send_json(ev)
+            last = len(events)
+            if job.get('status') in ('done', 'error'):
+                await websocket.send_json({'event': 'result', 'status': job.get('status'), 'result': job.get('result'), 'error': job.get('error')})
+                await websocket.close()
+                return
+            await asyncio.sleep(0.4)
+    except WebSocketDisconnect:
+        return
 
 # ── React SPA (built by Vite into static/) ──
 REACT_INDEX = os.path.join(APP_DIR, 'static', 'index.html')
