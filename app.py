@@ -516,24 +516,74 @@ def merge_direct_into_snapshot(snapshot: dict) -> dict:
     snapshot['_direct_shop_items'] = added
     return snapshot
 
-def build_snapshot(force=False):
-    """使用 Pipeline 引擎: 采集→标准化→分类→分组"""
-    if (not force) and os.path.exists(PIPELINE_CACHE_FILE):
-        try:
-            d = json.load(open(PIPELINE_CACHE_FILE))
-            if time.time() - d.get('ts', 0) < CACHE_TTL:
-                return merge_direct_into_snapshot(d)
-        except Exception:
-            pass
+def snapshot_item_count(data: dict) -> int:
+    """Count source items in a snapshot without counting direct-shop merge twice."""
+    if not isinstance(data, dict):
+        return 0
+    for key in ('source_items', 'all_items'):
+        val = data.get(key)
+        if isinstance(val, list) and val:
+            return len(val)
+    total = 0
+    for p in data.get('products') or []:
+        items = p.get('items') if isinstance(p, dict) else None
+        if isinstance(items, list):
+            total += len(items)
+    return total
 
-    result = _run_pipeline()
-    data = result.to_legacy()
+def load_nonempty_snapshot(path: str):
+    try:
+        if os.path.exists(path):
+            d = json.load(open(path))
+            if snapshot_item_count(d) > 0:
+                return d
+    except Exception:
+        pass
+    return None
+
+def save_snapshot_caches(data: dict):
+    """Persist only non-empty base snapshots. Direct-shop data stays in direct_shops.json."""
+    if snapshot_item_count(data) <= 0:
+        return False
     json.dump(data, open(PIPELINE_CACHE_FILE, 'w'), ensure_ascii=False, indent=2)
-    # Also write to old cache for compatibility
     try:
         json.dump(data, open(CACHE_FILE, 'w'), ensure_ascii=False, indent=2)
     except Exception:
         pass
+    return True
+
+def build_snapshot(force=False):
+    """使用 Pipeline 引擎: 采集→标准化→分类→分组；空抓取结果绝不覆盖旧缓存。"""
+    if (not force) and os.path.exists(PIPELINE_CACHE_FILE):
+        try:
+            d = json.load(open(PIPELINE_CACHE_FILE))
+            if time.time() - d.get('ts', 0) < CACHE_TTL and snapshot_item_count(d) > 0:
+                return merge_direct_into_snapshot(d)
+        except Exception:
+            pass
+
+    data = None
+    try:
+        result = _run_pipeline()
+        candidate = result.to_legacy()
+        if snapshot_item_count(candidate) > 0:
+            data = candidate
+            save_snapshot_caches(data)
+    except Exception as e:
+        data = None
+
+    if data is None:
+        # Upstream occasionally returns 0 items due to CDN/cookie issues. Keep the last good base snapshot.
+        data = load_nonempty_snapshot(PIPELINE_CACHE_FILE) or load_nonempty_snapshot(CACHE_FILE)
+
+    if data is None:
+        data = load_legacy_cache()
+        if data:
+            data.setdefault('ai_config', {})['note'] = 'Pipeline 实时抓取为空，已回退旧货源缓存；店铺解析数据仍按增量合并。'
+            save_snapshot_caches(data)
+
+    if data is None:
+        data = {'ts': time.time(), 'types': [], 'products': [], 'all_items': [], 'ai_config': {'mode': 'empty', 'note': '无可用货源缓存'}}
     return merge_direct_into_snapshot(data)
 
 def load_legacy_cache():
